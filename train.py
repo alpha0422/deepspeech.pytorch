@@ -12,6 +12,8 @@ from data.data_loader import AudioDataLoader, SpectrogramDataset, BucketingSampl
 from decoder import GreedyDecoder
 from model import DeepSpeech, supported_rnns
 
+import cudaprofile, sys
+
 parser = argparse.ArgumentParser(description='DeepSpeech training')
 parser.add_argument('--train_manifest', metavar='DIR',
                     help='path to train manifest csv', default='data/train_manifest.csv')
@@ -29,6 +31,8 @@ parser.add_argument('--hidden_layers', default=5, type=int, help='Number of RNN 
 parser.add_argument('--rnn_type', default='gru', help='Type of the RNN. rnn|gru|lstm are supported')
 parser.add_argument('--epochs', default=70, type=int, help='Number of training epochs')
 parser.add_argument('--cuda', dest='cuda', action='store_true', help='Use cuda to train model')
+parser.add_argument('--fp16', dest='fp16', action='store_true', help='Use FP16 to train model')
+parser.add_argument('--nvprof', dest='nvprof', action='store_true', help='Enable nvprof directive')
 parser.add_argument('--lr', '--learning-rate', default=3e-4, type=float, help='initial learning rate')
 parser.add_argument('--momentum', default=0.9, type=float, help='momentum')
 parser.add_argument('--max_norm', default=400, type=int, help='Norm cutoff to prevent explosion of gradients')
@@ -59,7 +63,6 @@ parser.add_argument('--no_shuffle', dest='no_shuffle', action='store_true',
                     help='Turn off shuffling and sample from dataset based on sequence length (smallest to largest)')
 parser.add_argument('--no_bidirectional', dest='bidirectional', action='store_false', default=True,
                     help='Turn off bi-directional RNNs, introduces lookahead convolution')
-
 
 def to_np(x):
     return x.data.cpu().numpy()
@@ -184,14 +187,30 @@ if __name__ == '__main__':
 
         rnn_type = args.rnn_type.lower()
         assert rnn_type in supported_rnns, "rnn_type should be either lstm, rnn or gru"
-        model = DeepSpeech(rnn_hidden_size=args.hidden_size,
-                           nb_layers=args.hidden_layers,
+        #model = DeepSpeech(rnn_hidden_size=args.hidden_size,
+        #                   nb_layers=args.hidden_layers,
+        #                   labels=labels,
+        #                   rnn_type=supported_rnns[rnn_type],
+        #                   audio_conf=audio_conf)
+
+        # The model they depoly
+        model = DeepSpeech(rnn_hidden_size=2560,
+                           nb_layers=5,
                            labels=labels,
                            rnn_type=supported_rnns[rnn_type],
                            audio_conf=audio_conf,
                            bidirectional=args.bidirectional)
         parameters = model.parameters()
-        optimizer = torch.optim.SGD(parameters, lr=args.lr,
+
+        # wkong added for fp16
+        if args.cuda and args.fp16:
+            param_copy = [param.clone().type(torch.cuda.FloatTensor).detach() for param in model.parameters()]
+            for param in param_copy:
+                param.requires_grad = True
+            optimizer = torch.optim.SGD(param_copy, lr=args.lr,
+                                    momentum=args.momentum, nesterov=True)
+        else:
+            optimizer = torch.optim.SGD(parameters, lr=args.lr,
                                     momentum=args.momentum, nesterov=True)
 
     decoder = GreedyDecoder(labels)
@@ -211,9 +230,15 @@ if __name__ == '__main__':
 
     if args.cuda:
         model = torch.nn.DataParallel(model).cuda()
+    if args.fp16:
+        model = model.half()
 
     print(model)
     print("Number of parameters: %d" % DeepSpeech.get_param_size(model))
+
+    # wkong added
+    #for name, param in model.named_parameters():
+    #    print name, param.size()
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -223,6 +248,13 @@ if __name__ == '__main__':
         model.train()
         end = time.time()
         for i, (data) in enumerate(train_loader, start=start_iter):
+            if args.nvprof:
+                if i == 3:
+                    cudaprofile.start()
+                elif i == 4:
+                    cudaprofile.stop()
+                    sys.exit()
+
             if i == len(train_sampler):
                 break
             inputs, targets, input_percentages, target_sizes = data
@@ -234,9 +266,15 @@ if __name__ == '__main__':
 
             if args.cuda:
                 inputs = inputs.cuda()
+            if args.fp16:
+                inputs = inputs.half()
 
             out = model(inputs)
             out = out.transpose(0, 1)  # TxNxH
+
+            # Cast the output from fp16 to fp32
+            if args.fp16:
+                out = out.cuda().float()
 
             seq_length = out.size(0)
             sizes = Variable(input_percentages.mul_(int(seq_length)).int(), requires_grad=False)
@@ -244,7 +282,12 @@ if __name__ == '__main__':
             loss = criterion(out, targets, sizes, target_sizes)
             loss = loss / inputs.size(0)  # average the loss by minibatch
 
-            loss_sum = loss.data.sum()
+            # Scale the loss
+            scale_factor = 128
+            if args.fp16:
+                loss_sum = loss.data.sum() * scale_factor
+            else:
+                loss_sum = loss.data.sum()
             inf = float("inf")
             if loss_sum == inf or loss_sum == -inf:
                 print("WARNING: received an inf loss, setting loss value to 0")
@@ -260,8 +303,21 @@ if __name__ == '__main__':
             loss.backward()
 
             torch.nn.utils.clip_grad_norm(model.parameters(), args.max_norm)
+
+            # Cast gradients to fp32
+            if args.fp16:
+                params = list(model.parameters())
+                for idx in range(len(params)):
+                    param_copy[idx]._grad =params[idx].grad.clone().type_as(param_copy[idx]).detach()
+                    param_copy[idx]._grad.mul_(1./scale_factor)
+
             # SGD step
             optimizer.step()
+
+            # Copy the updated parameters to the model
+            if args.fp16:
+                for idx in range(len(params)):
+                    params[idx].data.copy_(param_copy[idx].data)
 
             if args.cuda:
                 torch.cuda.synchronize()
@@ -308,6 +364,8 @@ if __name__ == '__main__':
 
             if args.cuda:
                 inputs = inputs.cuda()
+            if args.fp16:
+                inputs = inputs.half()
 
             out = model(inputs)
             out = out.transpose(0, 1)  # TxNxH

@@ -70,6 +70,15 @@ class BatchRNN(nn.Module):
             x = x.view(x.size(0), x.size(1), 2, -1).sum(2).view(x.size(0), x.size(1), -1)  # (TxNxH*2) -> (TxNxH) by sum
         return x
 
+class RowConv(nn.Conv1d):
+    def __init__(self, channels, tau):
+        super(RowConv, self).__init__(channels, channels, tau, groups=channels)
+
+    def forward(self, x):
+        x = x.transpose(0, 1).transpose(1, 2).contiguous()
+        x = super(RowConv, self).forward(x)
+        x = x.transpose(1, 2).transpose(0, 1).contiguous()
+        return x
 
 class Lookahead(nn.Module):
     # Wang et al 2016 - Lookahead Convolution Layer for Unidirectional Recurrent Neural Networks
@@ -162,9 +171,15 @@ class DeepSpeech(nn.Module):
 
         fully_connected = nn.Sequential(
             nn.BatchNorm1d(rnn_hidden_size),
+            nn.Hardtanh(0, 20, inplace=True),
+            nn.Linear(rnn_hidden_size, rnn_hidden_size),
+            nn.BatchNorm1d(rnn_hidden_size),
+            nn.Hardtanh(0, 20, inplace=True),
             nn.Linear(rnn_hidden_size, num_classes, bias=False)
         )
         self.fc = nn.Sequential(
+            SequenceWise(nn.BatchNorm1d(rnn_hidden_size)),
+            RowConv(rnn_hidden_size, 20),
             SequenceWise(fully_connected),
         )
         self.inference_softmax = InferenceBatchSoftmax()

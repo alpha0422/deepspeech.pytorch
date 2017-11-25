@@ -101,3 +101,9 @@ ENV/
 models/
 data/*.csv
 data/*_dataset/
+
+# wkong specific
+nvprof/
+*.export
+*.log
+slurm.sh
