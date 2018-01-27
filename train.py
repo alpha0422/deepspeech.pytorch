@@ -237,9 +237,9 @@ if __name__ == '__main__':
         print("Shuffling batches for the following epochs")
         train_sampler.shuffle(start_epoch)
 
-    if args.cuda:
+    if args.cuda and not args.distributed:
         model = torch.nn.DataParallel(model).cuda()
-    elif args.distributed:
+    elif args.cuda and args.distributed:
         model.cuda()
         model = torch.nn.parallel.DistributedDataParallel(model)
 
