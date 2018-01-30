@@ -12,9 +12,32 @@ from data.data_loader import AudioDataLoader, SpectrogramDataset, BucketingSampl
 from decoder import GreedyDecoder
 from model import DeepSpeech, supported_rnns
 
-import cudaprofile, sys
+import pdb, sys, functools, cudaprofile
+#import pdb, sys, functools, fancydebug, cudaprofile
+from profiling import Profiling
 
-parser = argparse.ArgumentParser(description='DeepSpeech training')
+def nvprofhook_start(self, grad_input, grad_output):
+    cudaprofile.start()
+
+def nvprofhook_stop(self, grad_input, grad_output):
+    cudaprofile.stop()
+    sys.exit()
+
+def nvtxhook_mark(self, grad_input, grad_output):
+    torch.cuda.nvtx.mark(repr(self))
+
+
+def hook(function, prefunc, postfunc):
+    @functools.wraps(function)
+    def run(*args, **kwargs):
+        prefunc(*args, **kwargs)
+        ret = function(*args, **kwargs)
+        postfunc(*args, **kwargs)
+        return ret
+    return run
+
+parser = argparse.ArgumentParser(description='DeepSpeech training',
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument('--train_manifest', metavar='DIR',
                     help='path to train manifest csv', default='data/train_manifest.csv')
 parser.add_argument('--val_manifest', metavar='DIR',
@@ -26,9 +49,16 @@ parser.add_argument('--labels_path', default='labels.json', help='Contains all c
 parser.add_argument('--window_size', default=.02, type=float, help='Window size for spectrogram in seconds')
 parser.add_argument('--window_stride', default=.01, type=float, help='Window stride for spectrogram in seconds')
 parser.add_argument('--window', default='hamming', help='Window type for spectrogram generation')
+parser.add_argument('--conv_layers', default=2, type=int, choices=[1, 2, 3],
+    help='Number of convolution layers.')
+parser.add_argument('--conv_type', default='Conv2d', type=str, choices=['Conv1d', 'Conv2d'],
+    help='Type of convolution layers.')
 parser.add_argument('--hidden_size', default=800, type=int, help='Hidden size of RNNs')
 parser.add_argument('--hidden_layers', default=5, type=int, help='Number of RNN layers')
 parser.add_argument('--rnn_type', default='gru', help='Type of the RNN. rnn|gru|lstm are supported')
+parser.add_argument('--fuse_rnn', action='store_true', help='Fuse RNN layers into one call.')
+parser.add_argument('--fc_layers', default=2, type=int, choices=[1, 2], help='Number of fully connected layers.')
+parser.add_argument('--bn', action='store_true', help='Add bach/sequence-wise normalization layers.')
 parser.add_argument('--epochs', default=70, type=int, help='Number of training epochs')
 parser.add_argument('--cuda', dest='cuda', action='store_true', help='Use cuda to train model')
 parser.add_argument('--fp16', dest='fp16', action='store_true', help='Use FP16 to train model')
@@ -187,19 +217,17 @@ if __name__ == '__main__':
 
         rnn_type = args.rnn_type.lower()
         assert rnn_type in supported_rnns, "rnn_type should be either lstm, rnn or gru"
-        #model = DeepSpeech(rnn_hidden_size=args.hidden_size,
-        #                   nb_layers=args.hidden_layers,
-        #                   labels=labels,
-        #                   rnn_type=supported_rnns[rnn_type],
-        #                   audio_conf=audio_conf)
-
-        # The model they depoly
-        model = DeepSpeech(rnn_hidden_size=2560,
-                           nb_layers=5,
-                           labels=labels,
+        model = DeepSpeech(conv_layers=args.conv_layers,
+                           conv_type=args.conv_type,
+                           rnn_hidden_size=args.hidden_size,
+                           rnn_layers=args.hidden_layers,
                            rnn_type=supported_rnns[rnn_type],
-                           audio_conf=audio_conf,
-                           bidirectional=args.bidirectional)
+                           bidirectional=args.bidirectional,
+                           fuse_rnn=args.fuse_rnn,
+                           fc_layers=args.fc_layers,
+                           bn=args.bn,
+                           labels=labels,
+                           audio_conf=audio_conf)
         parameters = model.parameters()
 
         # wkong added for fp16
@@ -249,10 +277,13 @@ if __name__ == '__main__':
         end = time.time()
         for i, (data) in enumerate(train_loader, start=start_iter):
             if args.nvprof:
-                if i == 3:
+                if i == 0:
                     cudaprofile.start()
-                elif i == 4:
+                    p = Profiling(model).start()
+                elif i == 5:
+                    p.stop()
                     cudaprofile.stop()
+                    #print(p)
                     sys.exit()
 
             if i == len(train_sampler):
@@ -269,25 +300,33 @@ if __name__ == '__main__':
             if args.fp16:
                 inputs = inputs.half()
 
+            #model.module.rnns[4]._modules['rnn'].register_backward_hook(nvtxhook_mark)
+            #torch.autograd.backward = hook(torch.autograd.backward, prefunc, postfunc)
+
             out = model(inputs)
             out = out.transpose(0, 1)  # TxNxH
 
+            if args.nvprof:  torch.cuda.nvtx.range_push('Fprop OutputCast2fp32')
             # Cast the output from fp16 to fp32
             if args.fp16:
                 out = out.cuda().float()
+            if args.nvprof:  torch.cuda.nvtx.range_pop()
 
             seq_length = out.size(0)
             sizes = Variable(input_percentages.mul_(int(seq_length)).int(), requires_grad=False)
 
+            if args.nvprof:  torch.cuda.nvtx.range_push('Fprop CTCLoss')
             loss = criterion(out, targets, sizes, target_sizes)
             loss = loss / inputs.size(0)  # average the loss by minibatch
+            if args.nvprof:  torch.cuda.nvtx.range_pop()
 
+            if args.nvprof:  torch.cuda.nvtx.range_push('Fprop LossScaling')
             # Scale the loss
-            scale_factor = 128
+            if 'scale_factor' not in locals():  scale_factor = 1024
             if args.fp16:
-                loss_sum = loss.data.sum() * scale_factor
-            else:
-                loss_sum = loss.data.sum()
+                loss = loss * scale_factor
+
+            loss_sum = loss.data.sum()
             inf = float("inf")
             if loss_sum == inf or loss_sum == -inf:
                 print("WARNING: received an inf loss, setting loss value to 0")
@@ -297,27 +336,41 @@ if __name__ == '__main__':
 
             avg_loss += loss_value
             losses.update(loss_value, inputs.size(0))
+            if args.nvprof:  torch.cuda.nvtx.range_pop()
 
             # compute gradient
+            if args.nvprof:  torch.cuda.nvtx.range_push('Bprop ZeroGrad')
             optimizer.zero_grad()
+            if args.nvprof:  torch.cuda.nvtx.range_pop()
             loss.backward()
 
-            torch.nn.utils.clip_grad_norm(model.parameters(), args.max_norm)
-
             # Cast gradients to fp32
+            if args.nvprof:  torch.cuda.nvtx.range_push('Bprop GradCast2fp32')
             if args.fp16:
                 params = list(model.parameters())
                 for idx in range(len(params)):
-                    param_copy[idx]._grad =params[idx].grad.clone().type_as(param_copy[idx]).detach()
+                    if params[idx].grad is None:
+                        continue
+                    param_copy[idx]._grad = params[idx].grad.clone().type_as(param_copy[idx]).detach()
                     param_copy[idx]._grad.mul_(1./scale_factor)
+            if args.nvprof:  torch.cuda.nvtx.range_pop()
+
+            # Clip gradients norm
+            if args.nvprof:  torch.cuda.nvtx.range_push('Bprop clip_grad_norm')
+            torch.nn.utils.clip_grad_norm(model.parameters(), args.max_norm)
+            if args.nvprof:  torch.cuda.nvtx.range_pop()
 
             # SGD step
+            if args.nvprof:  torch.cuda.nvtx.range_push('Bprop SGDStep')
             optimizer.step()
+            if args.nvprof:  torch.cuda.nvtx.range_pop()
 
             # Copy the updated parameters to the model
+            if args.nvprof:  torch.cuda.nvtx.range_push('Bprop CopyFP16Param2FP32')
             if args.fp16:
                 for idx in range(len(params)):
                     params[idx].data.copy_(param_copy[idx].data)
+            if args.nvprof: torch.cuda.nvtx.range_pop()
 
             if args.cuda:
                 torch.cuda.synchronize()
@@ -339,6 +392,7 @@ if __name__ == '__main__':
                                                 loss_results=loss_results,
                                                 wer_results=wer_results, cer_results=cer_results, avg_loss=avg_loss),
                            file_path)
+
             del loss
             del out
         avg_loss /= len(train_sampler)

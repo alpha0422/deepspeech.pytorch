@@ -73,9 +73,12 @@ class BatchRNN(nn.Module):
 class RowConv(nn.Conv1d):
     def __init__(self, channels, tau):
         super(RowConv, self).__init__(channels, channels, tau, groups=channels)
+        self.tau = tau
 
     def forward(self, x):
+        # x.size(): (seq_length, batch_size, hidden_size)
         x = x.transpose(0, 1).transpose(1, 2).contiguous()
+        x = torch.nn.functional.pad(x, (0, self.tau-1), 'constant', 0)
         x = super(RowConv, self).forward(x)
         x = x.transpose(1, 2).transpose(0, 1).contiguous()
         return x
@@ -121,17 +124,48 @@ class Lookahead(nn.Module):
 
 
 class DeepSpeech(nn.Module):
-    def __init__(self, rnn_type=nn.LSTM, labels="abc", rnn_hidden_size=768, nb_layers=5, audio_conf=None,
-                 bidirectional=True, context=20):
+    # Please refer to http://proceedings.mlr.press/v48/amodei16.pdf
+    _presets = {
+        '1Conv1d' : {'num_filters' : [1280],
+                     'filter_size' : [(1, 11)],
+                     'stride' : [(1, 2)],
+                     'padding' : [(0, 10)],},
+        '2Conv1d' : {'num_filters' : [640, 640],
+                     'filter_size' : [(1, 5), (1, 5)],
+                     'stride' : [(1, 1), (1, 2)],
+                     'padding' : [(0, 4), (0, 0)],},
+        '3Conv1d' : {'num_filters' : [512, 512, 512],
+                     'filter_size' : [(1, 5), (1, 5), (1, 5)],
+                     'stride' : [(1, 1), (1, 1), (1, 2)],
+                     'padding' : [(0, 4), (0, 0), (0, 0)],},
+        '1Conv2d' : {'num_filters' : [32],
+                     'filter_size' : [(41, 11)],
+                     'stride' : [(2, 2)],
+                     'padding':[(0, 10)]},
+        '2Conv2d' : {'num_filters': [32, 32],
+                     'filter_size' : [(41, 11), (21, 11)],
+                     'stride' : [(2, 2), (2, 1)],
+                     'padding':[(0, 10), (0, 0)]},
+        '3Conv2d' : {'num_filters' : [32, 32, 96],
+                     'filter_size' : [(41, 11), (21, 11), (21, 11)],
+                     'stride' : [(2, 2), (2, 1), (2, 1)],
+                     'padding' : [(0, 10), (0, 0), (0, 0)]},
+        'RowConv' : {'tau':19},
+        'Linear' : {'hidden_size':29},
+    }
+
+    def __init__(self, conv_layers=2, conv_type='Conv2d', rnn_type=nn.LSTM, labels="abc", rnn_hidden_size=768, rnn_layers=5, fuse_rnn=False, audio_conf=None, bidirectional=True, fc_layers=2, bn=True, context=20):
         super(DeepSpeech, self).__init__()
 
         # model metadata needed for serialization/deserialization
         if audio_conf is None:
             audio_conf = {}
         self._version = '0.0.1'
+        self._conv_layers = conv_layers
         self._hidden_size = rnn_hidden_size
-        self._hidden_layers = nb_layers
+        self._hidden_layers = rnn_layers
         self._rnn_type = rnn_type
+        self._fc_layers = fc_layers
         self._audio_conf = audio_conf or {}
         self._labels = labels
         self._bidirectional = bidirectional
@@ -140,48 +174,100 @@ class DeepSpeech(nn.Module):
         window_size = self._audio_conf.get("window_size", 0.02)
         num_classes = len(self._labels)
 
-        self.conv = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=(41, 11), stride=(2, 2), padding=(0, 10)),
-            nn.BatchNorm2d(32),
-            nn.Hardtanh(0, 20, inplace=True),
-            nn.Conv2d(32, 32, kernel_size=(21, 11), stride=(2, 1), ),
-            nn.BatchNorm2d(32),
-            nn.Hardtanh(0, 20, inplace=True)
-        )
         # Based on above convolutions and spectrogram size using conv formula (W - F + 2P)/ S+1
         rnn_input_size = int(math.floor((sample_rate * window_size) / 2) + 1)
-        rnn_input_size = int(math.floor(rnn_input_size - 41) / 2 + 1)
-        rnn_input_size = int(math.floor(rnn_input_size - 21) / 2 + 1)
-        rnn_input_size *= 32
 
-        rnns = []
-        rnn = BatchRNN(input_size=rnn_input_size, hidden_size=rnn_hidden_size, rnn_type=rnn_type,
-                       bidirectional=bidirectional, batch_norm=False)
-        rnns.append(('0', rnn))
-        for x in range(nb_layers - 1):
-            rnn = BatchRNN(input_size=rnn_hidden_size, hidden_size=rnn_hidden_size, rnn_type=rnn_type,
-                           bidirectional=bidirectional)
-            rnns.append(('%d' % (x + 1), rnn))
-        self.rnns = nn.Sequential(OrderedDict(rnns))
-        self.lookahead = nn.Sequential(
-            # consider adding batch norm?
-            Lookahead(rnn_hidden_size, context=context),
-            nn.Hardtanh(0, 20, inplace=True)
-        ) if not bidirectional else None
+        # Convolution layers
+        convs = []
+        prev_channels = 1
+        for i in range(conv_layers):
+            # Setup convolution layer
+            idx = '{}{}'.format(i+1, conv_type)
+            layer = nn.Conv2d(prev_channels, DeepSpeech._presets[idx]['num_filters'][i],
+                kernel_size = DeepSpeech._presets[idx]['filter_size'][i],
+                stride = DeepSpeech._presets[idx]['stride'][i],
+                padding = DeepSpeech._presets[idx]['padding'][i],
+                )
+            convs.append((str(len(convs)), layer))
+            prev_channels = DeepSpeech._presets[idx]['num_filters'][i]
 
-        fully_connected = nn.Sequential(
-            nn.BatchNorm1d(rnn_hidden_size),
-            nn.Hardtanh(0, 20, inplace=True),
-            nn.Linear(rnn_hidden_size, rnn_hidden_size),
-            nn.BatchNorm1d(rnn_hidden_size),
-            nn.Hardtanh(0, 20, inplace=True),
-            nn.Linear(rnn_hidden_size, num_classes, bias=False)
-        )
+            # Setup batch normalization
+            if bn:
+                layer = nn.BatchNorm2d(prev_channels)
+                convs.append((str(len(convs)), layer))
+
+            # Setup activation
+            layer = nn.Hardtanh(0, 20, inplace=True)
+            convs.append((str(len(convs)), layer))
+
+            # rnn_input_size is used for following reshape
+            rnn_input_size = int(math.floor((rnn_input_size -
+                DeepSpeech._presets[idx]['filter_size'][i][0] + 2 *
+                DeepSpeech._presets[idx]['padding'][i][0]) /
+                DeepSpeech._presets[idx]['stride'][i][0]) + 1)
+
+        self.conv = nn.Sequential(OrderedDict(convs))
+        rnn_input_size *= prev_channels
+
+        # Recurrent layers
+        if fuse_rnn:
+            assert bn == False
+            self.rnns = rnn_type(input_size=rnn_input_size, hidden_size=rnn_hidden_size,
+                num_layers=rnn_layers, bidirectional=bidirectional, bias=False)
+        else:
+            rnns = []
+            rnn = BatchRNN(input_size=rnn_input_size, hidden_size=rnn_hidden_size,
+                rnn_type=rnn_type, bidirectional=bidirectional, batch_norm=False)
+            rnns.append(('0', rnn))
+            for x in range(rnn_layers - 1):
+                rnn = BatchRNN(input_size=rnn_hidden_size, hidden_size=rnn_hidden_size,
+                    rnn_type=rnn_type, bidirectional=bidirectional, batch_norm=bn)
+                rnns.append(('%d' % (x + 1), rnn))
+            self.rnns = nn.Sequential(OrderedDict(rnns))
+
+        # Lookahead layer of `SeanNaren/deepspeech.pytorch` is inefficient,
+        # I rewirte it using group convolution.
+        self.lookahead = RowConv(rnn_hidden_size, DeepSpeech._presets['RowConv']['tau'])
+
+        # `SeanNaren/deepspeech.pytorch` lookahead implementation
+        #self.lookahead = nn.Sequential(
+        #    # consider adding batch norm?
+        #    Lookahead(rnn_hidden_size, context=context),
+        #    nn.Hardtanh(0, 20, inplace=True)
+        #) if not bidirectional else None
+
+        # Fully connected layers
+        assert fc_layers in (1, 2)
+        if fc_layers == 2:
+            if bn:
+                fully_connected = nn.Sequential(
+                    nn.BatchNorm1d(rnn_hidden_size),
+                    nn.Linear(rnn_hidden_size, rnn_hidden_size),
+                    nn.Hardtanh(0, 20, inplace=True),
+                    nn.Linear(rnn_hidden_size, num_classes, bias=False)
+                )
+            else:
+                fully_connected = nn.Sequential(
+                    nn.Linear(rnn_hidden_size, rnn_hidden_size),
+                    nn.Hardtanh(0, 20, inplace=True),
+                    nn.Linear(rnn_hidden_size, num_classes, bias=False)
+                )
+        else:
+            if bn:
+                fully_connected = nn.Sequential(
+                    nn.BatchNorm1d(rnn_hidden_size),
+                    nn.Linear(rnn_hidden_size, num_classes, bias=False)
+                )
+            else:
+                fully_connected = nn.Sequential(
+                    nn.Linear(rnn_hidden_size, num_classes, bias=False)
+                )
+
         self.fc = nn.Sequential(
-            SequenceWise(nn.BatchNorm1d(rnn_hidden_size)),
-            RowConv(rnn_hidden_size, 20),
             SequenceWise(fully_connected),
         )
+
+        # Inference softmax
         self.inference_softmax = InferenceBatchSoftmax()
 
     def forward(self, x):
@@ -192,6 +278,7 @@ class DeepSpeech(nn.Module):
         x = x.transpose(1, 2).transpose(0, 1).contiguous()  # TxNxH
 
         x = self.rnns(x)
+        if type(x) is tuple:  x = x[0]
 
         if not self._bidirectional:  # no need for lookahead layer in bidirectional
             x = self.lookahead(x)
@@ -205,7 +292,7 @@ class DeepSpeech(nn.Module):
     @classmethod
     def load_model(cls, path, cuda=False):
         package = torch.load(path, map_location=lambda storage, loc: storage)
-        model = cls(rnn_hidden_size=package['hidden_size'], nb_layers=package['hidden_layers'],
+        model = cls(rnn_hidden_size=package['hidden_size'], rnn_layers=package['hidden_layers'],
                     labels=package['labels'], audio_conf=package['audio_conf'],
                     rnn_type=supported_rnns[package['rnn_type']], bidirectional=package.get('bidirectional', True))
         # the blacklist parameters are params that were previous erroneously saved by the model
@@ -225,7 +312,7 @@ class DeepSpeech(nn.Module):
 
     @classmethod
     def load_model_package(cls, package, cuda=False):
-        model = cls(rnn_hidden_size=package['hidden_size'], nb_layers=package['hidden_layers'],
+        model = cls(rnn_hidden_size=package['hidden_size'], rnn_layers=package['hidden_layers'],
                     labels=package['labels'], audio_conf=package['audio_conf'],
                     rnn_type=supported_rnns[package['rnn_type']], bidirectional=package.get('bidirectional', True))
         model.load_state_dict(package['state_dict'])

@@ -104,6 +104,8 @@ data/*_dataset/
 
 # wkong specific
 nvprof/
+data/dummy-*
+variants/
 *.export
 *.log
 slurm.sh
