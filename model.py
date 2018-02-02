@@ -154,7 +154,7 @@ class DeepSpeech(nn.Module):
         'Linear' : {'hidden_size':29},
     }
 
-    def __init__(self, conv_layers=2, conv_type='Conv2d', rnn_type=nn.LSTM, labels="abc", rnn_hidden_size=768, rnn_layers=5, fuse_rnn=False, audio_conf=None, bidirectional=True, fc_layers=2, bn=True, context=20):
+    def __init__(self, conv_layers=2, conv_type='Conv2d', pooling=False, rnn_type=nn.LSTM, labels="abc", rnn_hidden_size=768, rnn_layers=5, fuse_rnn=False, audio_conf=None, bidirectional=True, fc_layers=2, bn=True, context=20):
         super(DeepSpeech, self).__init__()
 
         # model metadata needed for serialization/deserialization
@@ -185,11 +185,20 @@ class DeepSpeech(nn.Module):
             idx = '{}{}'.format(i+1, conv_type)
             layer = nn.Conv2d(prev_channels, DeepSpeech._presets[idx]['num_filters'][i],
                 kernel_size = DeepSpeech._presets[idx]['filter_size'][i],
-                stride = DeepSpeech._presets[idx]['stride'][i],
+                stride = 1 if pooling else DeepSpeech._presets[idx]['stride'][i],
                 padding = DeepSpeech._presets[idx]['padding'][i],
                 )
             convs.append((str(len(convs)), layer))
             prev_channels = DeepSpeech._presets[idx]['num_filters'][i]
+
+            # Set pooling layer if needed
+            # PyTorch use floor pooling, need padding to make sequence length right
+            if pooling:
+                layer = nn.MaxPool2d(DeepSpeech._presets[idx]['stride'][i],
+                    padding = tuple([int(math.floor(x/2)) for x in
+                        DeepSpeech._presets[idx]['stride'][i]]),
+                    )
+                convs.append((str(len(convs)), layer))
 
             # Setup batch normalization
             if bn:

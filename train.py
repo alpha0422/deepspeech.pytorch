@@ -53,6 +53,7 @@ parser.add_argument('--conv_layers', default=2, type=int, choices=[1, 2, 3],
     help='Number of convolution layers.')
 parser.add_argument('--conv_type', default='Conv2d', type=str, choices=['Conv1d', 'Conv2d'],
     help='Type of convolution layers.')
+parser.add_argument('--pooling', action='store_true', help='Replace strided convolution with non-strided convolution and pooling layers.')
 parser.add_argument('--hidden_size', default=800, type=int, help='Hidden size of RNNs')
 parser.add_argument('--hidden_layers', default=5, type=int, help='Number of RNN layers')
 parser.add_argument('--rnn_type', default='gru', help='Type of the RNN. rnn|gru|lstm are supported')
@@ -219,6 +220,7 @@ if __name__ == '__main__':
         assert rnn_type in supported_rnns, "rnn_type should be either lstm, rnn or gru"
         model = DeepSpeech(conv_layers=args.conv_layers,
                            conv_type=args.conv_type,
+                           pooling=args.pooling,
                            rnn_hidden_size=args.hidden_size,
                            rnn_layers=args.hidden_layers,
                            rnn_type=supported_rnns[rnn_type],
