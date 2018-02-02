@@ -7,7 +7,7 @@ import pdb
 
 # Keep global layer id
 layer_ids = set()
-count = 0
+count = 1
 
 class Profiling(object):
     def __init__(self, model):
@@ -88,7 +88,6 @@ class Profiling(object):
                     # Push nvtx range and sol calculator
                     torch.cuda.nvtx.range_push('Fprop ' + str(self).split('(')[0].strip()
                             +'.{}'.format(count))
-                    count = count + 1
 
                     # Call the origin function
                     start_time = time.time()
@@ -139,6 +138,9 @@ class Profiling(object):
                             print layer_name+','+','.join(map(lambda x: x if x is '' else '={}'.format(x), (layer_fma, layer_input, layer_weight, layer_output)))
                         except:
                             print layer_name
+
+                    # Update layer count
+                    count = count + 1
 
                     def backward_pre_hook(*args):
                         if (this_profiler.profiling_on):
