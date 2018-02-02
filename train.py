@@ -308,11 +308,11 @@ if __name__ == '__main__':
             out = model(inputs)
             out = out.transpose(0, 1)  # TxNxH
 
-            if args.nvprof:  torch.cuda.nvtx.range_push('Fprop OutputCast2fp32')
             # Cast the output from fp16 to fp32
             if args.fp16:
+                if args.nvprof:  torch.cuda.nvtx.range_push('Fprop OutputCast2fp32')
                 out = out.cuda().float()
-            if args.nvprof:  torch.cuda.nvtx.range_pop()
+                if args.nvprof:  torch.cuda.nvtx.range_pop()
 
             seq_length = out.size(0)
             sizes = Variable(input_percentages.mul_(int(seq_length)).int(), requires_grad=False)
@@ -324,8 +324,9 @@ if __name__ == '__main__':
 
             if args.nvprof:  torch.cuda.nvtx.range_push('Fprop LossScaling')
             # Scale the loss
-            if 'scale_factor' not in locals():  scale_factor = 1024
             if args.fp16:
+                if 'scale_factor' not in locals():  scale_factor = 32*1024
+                if 'non_overflow_iters' not in locals():  non_overflow_iters = 0
                 loss = loss * scale_factor
 
             loss_sum = loss.data.sum()
@@ -347,15 +348,38 @@ if __name__ == '__main__':
             loss.backward()
 
             # Cast gradients to fp32
-            if args.nvprof:  torch.cuda.nvtx.range_push('Bprop GradCast2fp32')
             if args.fp16:
+                if args.nvprof:  torch.cuda.nvtx.range_push('Bprop GradCast2fp32')
+
+                overflow = False
                 params = list(model.parameters())
+
+                # Dynamic loss scaling, check if gradients overflow
                 for idx in range(len(params)):
                     if params[idx].grad is None:
                         continue
-                    param_copy[idx]._grad = params[idx].grad.clone().type_as(param_copy[idx]).detach()
+                    if (torch.eq(params[idx].grad.data, float('Inf')).any() or
+                        torch.eq(params[idx].grad.data, float('NaN')).any()):
+                        overflow = True
+                        break
+
+                # Skip gradient update if overflow detected
+                if overflow:
+                    print 'Overflow!'
+                    scale_factor *= 0.5
+                    non_overflow_iters = 0
+                    if args.nvprof:  torch.cuda.nvtx.range_pop()
+                    continue
+
+                # Update the weight gradient with scale 1/S
+                for idx in range(len(params)):
+                    if params[idx].grad is None:
+                        continue
+                    param_copy[idx]._grad = \
+                        params[idx].grad.clone().type_as(param_copy[idx]).detach()
                     param_copy[idx]._grad.mul_(1./scale_factor)
-            if args.nvprof:  torch.cuda.nvtx.range_pop()
+
+                if args.nvprof:  torch.cuda.nvtx.range_pop()
 
             # Clip gradients norm
             if args.nvprof:  torch.cuda.nvtx.range_push('Bprop clip_grad_norm')
@@ -368,11 +392,18 @@ if __name__ == '__main__':
             if args.nvprof:  torch.cuda.nvtx.range_pop()
 
             # Copy the updated parameters to the model
-            if args.nvprof:  torch.cuda.nvtx.range_push('Bprop CopyFP16Param2FP32')
             if args.fp16:
+                if args.nvprof:  torch.cuda.nvtx.range_push('Bprop CopyFP16Param2FP32')
                 for idx in range(len(params)):
                     params[idx].data.copy_(param_copy[idx].data)
-            if args.nvprof: torch.cuda.nvtx.range_pop()
+
+                # If there hasn't been an Inf or NaN in the last N iterations, increase S
+                non_overflow_iters += 1
+                if non_overflow_iters >= 2000:
+                    scale_factor *= 2
+                    non_overflow_iters = 0
+
+                if args.nvprof: torch.cuda.nvtx.range_pop()
 
             if args.cuda:
                 torch.cuda.synchronize()
