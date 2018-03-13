@@ -94,6 +94,7 @@ parser.add_argument('--no_shuffle', dest='no_shuffle', action='store_true',
                     help='Turn off shuffling and sample from dataset based on sequence length (smallest to largest)')
 parser.add_argument('--no_bidirectional', dest='bidirectional', action='store_false', default=True,
                     help='Turn off bi-directional RNNs, introduces lookahead convolution')
+parser.add_argument('--benchmark', action='store_true', help='Turn on PyTorch benchmark mode')
 
 def to_np(x):
     return x.data.cpu().numpy()
@@ -121,6 +122,9 @@ class AverageMeter(object):
 if __name__ == '__main__':
     args = parser.parse_args()
     save_folder = args.save_folder
+
+    if args.benchmark and args.cuda:
+        torch.backends.cudnn.benchmark = True
 
     loss_results, cer_results, wer_results = torch.Tensor(args.epochs), torch.Tensor(args.epochs), torch.Tensor(
         args.epochs)
