@@ -165,6 +165,8 @@ class GreedyDecoder(Decoder):
     def process_string(self, sequence, size, remove_repetitions=False):
         string = ''
         offsets = []
+        sequence = sequence.cpu().numpy()
+
         for i in range(size):
             char = self.int_to_char[sequence[i]]
             if char != self.int_to_char[self.blank_index]:

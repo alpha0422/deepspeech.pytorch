@@ -3,6 +3,7 @@ import errno
 import json
 import os
 import time
+import math
 
 import torch
 from tqdm import tqdm
@@ -347,7 +348,7 @@ if __name__ == '__main__':
 
             # compute gradient
             if args.nvprof:  torch.cuda.nvtx.range_push('Bprop ZeroGrad')
-            optimizer.zero_grad()
+            model.zero_grad()
             if args.nvprof:  torch.cuda.nvtx.range_pop()
             loss.backward()
 
@@ -362,18 +363,6 @@ if __name__ == '__main__':
                 for idx in range(len(params)):
                     if params[idx].grad is None:
                         continue
-                    if (torch.eq(params[idx].grad.data, float('Inf')).any() or
-                        torch.eq(params[idx].grad.data, float('NaN')).any()):
-                        overflow = True
-                        break
-
-                # Skip gradient update if overflow detected
-                if overflow:
-                    print 'Overflow!'
-                    scale_factor *= 0.5
-                    non_overflow_iters = 0
-                    if args.nvprof:  torch.cuda.nvtx.range_pop()
-                    continue
 
                 # Update the weight gradient with scale 1/S
                 for idx in range(len(params)):
@@ -387,8 +376,14 @@ if __name__ == '__main__':
 
             # Clip gradients norm
             if args.nvprof:  torch.cuda.nvtx.range_push('Bprop clip_grad_norm')
-            torch.nn.utils.clip_grad_norm(model.parameters(), args.max_norm)
+            norm = torch.nn.utils.clip_grad_norm(param_copy if args.fp16 else model.parameters(), args.max_norm)
             if args.nvprof:  torch.cuda.nvtx.range_pop()
+            
+            if not math.isfinite(norm): 
+                print('Overflow!')
+                scale_factor *= 0.5
+                non_overflow_iters = 0
+                continue
 
             # SGD step
             if args.nvprof:  torch.cuda.nvtx.range_push('Bprop SGDStep')
@@ -397,7 +392,7 @@ if __name__ == '__main__':
 
             # Copy the updated parameters to the model
             if args.fp16:
-                if args.nvprof:  torch.cuda.nvtx.range_push('Bprop CopyFP16Param2FP32')
+                if args.nvprof:  torch.cuda.nvtx.range_push('Bprop CopyFP32Param2FP16')
                 for idx in range(len(params)):
                     params[idx].data.copy_(param_copy[idx].data)
 
@@ -462,6 +457,9 @@ if __name__ == '__main__':
             out = out.transpose(0, 1)  # TxNxH
             seq_length = out.size(0)
             sizes = input_percentages.mul_(int(seq_length)).int()
+
+            if args.fp16:
+                out = out.float()
 
             decoded_output, _ = decoder.decode(out.data, sizes)
             target_strings = decoder.convert_to_strings(split_targets)

@@ -61,7 +61,7 @@ class Profiling(object):
         self.profiling_on = True
 
         # Print table header
-        print 'Layer,FMA,Input,Weight,Output'
+        print('Layer,FMA,Input,Weight,Output')
 
         return self
 
@@ -135,9 +135,9 @@ class Profiling(object):
                                 layer_fma = ''
 
                             # Print the data for SOL
-                            print layer_name+','+','.join(map(lambda x: x if x is '' else '={}'.format(x), (layer_fma, layer_input, layer_weight, layer_output)))
+                            print(layer_name+','+','.join(map(lambda x: x if x is '' else '={}'.format(x), (layer_fma, layer_input, layer_weight, layer_output))))
                         except:
-                            print layer_name
+                            print(layer_name)
 
                     # Update layer count
                     count = count + 1
